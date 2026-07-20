@@ -33,13 +33,11 @@ index ONCE at startup, keyed by (sorted A-site tuple, sorted B-site tuple).
 Every search after that is an O(1) dictionary lookup.
 """
 
-import os
-import re
 from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, render_template, request
 
 app = Flask(__name__)
 
@@ -49,43 +47,85 @@ ELEMENTS_PATH = DATA_DIR / "elements.csv"
 
 # ----------------------------------------------------------------------
 # Load & clean data
-#
-# MEMORY NOTE (learned the hard way on a 512MB free host): the dtype=str
-# 500k-row DataFrame is only half the picture. The old version of this
-# file also built `dpo_index` as {key: [full row dict, ...]} — a SECOND
-# complete copy of the entire database as Python dict objects, which cost
-# far more RAM per value than pandas' columnar storage. That duplication
-# was the actual OOM cause, not the CSV read itself. Fix: dpo_index now
-# stores lightweight integer row positions, and rows are pulled from
-# dpo_df (the single source of truth) on demand via .iloc[].
 # ----------------------------------------------------------------------
 
 print("[AtomAI] Loading databases...")
 
-# Every column here is text-like in the source CSVs (formulas, ion labels,
-# etc.), so reading everything as a fixed dtype avoids pandas' expensive
-# per-chunk type-sniffing (that's what the DtypeWarning was about) without
-# ballooning memory the way full type inference across mixed columns can.
-dpo_df = pd.read_csv(DPO_PATH, dtype=str, keep_default_na=False, low_memory=False)
-elements_df = pd.read_csv(ELEMENTS_PATH, dtype=str, keep_default_na=False, low_memory=False)
+# Tell pandas the exact final dtype for every column up front, so its C
+# parser writes each value directly into a compact float32 / category
+# array in a single pass. Reading loosely first and downcasting afterward
+# briefly holds BOTH the larger intermediate representation and the
+# smaller final one in memory at the same time — a transient spike that
+# can get a process OOM-killed even when its steady-state memory is fine.
+DPO_TEXT_COLUMNS = {
+    "Formula",
+    "A_site_key",
+    "B_site_key",
+    "Formula_with_Oxidation_State",
+}
+DPO_CATEGORY_COLUMNS = {"DPO_Type", "Material_Status"}
+DPO_FLOAT_COLUMNS = {
+    "mu",
+    "mu_a",
+    "mu_b",
+    "tolerance_factor",
+    "Band_Gap",
+    "mean_confidence",
+}
 
-dpo_df.columns = dpo_df.columns.str.strip()
+DPO_PARQUET_PATH = DATA_DIR / "dpo_database.parquet"
+
+if DPO_PARQUET_PATH.exists():
+    # Fast path: Parquet is a compressed, column-oriented binary format.
+    # Loading it is dramatically faster and lower-memory than parsing an
+    # 80MB+ CSV through pandas' text parser on every deploy/restart — this
+    # is what makes the app reliable on a memory-constrained free host.
+    # Build this file locally with convert_to_parquet.py and commit it.
+    print(f"[AtomAI] Loading {DPO_PARQUET_PATH.name} (fast path)...")
+    dpo_df = pd.read_parquet(DPO_PARQUET_PATH)
+    dpo_df.columns = dpo_df.columns.str.strip()
+else:
+    # Fallback: parse the raw CSV directly. Works anywhere, but slower and
+    # more memory-hungry — fine for local development, not recommended for
+    # a constrained free-tier deploy. Run convert_to_parquet.py once and
+    # commit the resulting .parquet file to avoid this path in production.
+    print(f"[AtomAI] No Parquet file found — parsing {DPO_PATH.name} directly...")
+    _header = pd.read_csv(DPO_PATH, nrows=0).columns.str.strip().tolist()
+    _dtype_map = {}
+    for _col in _header:
+        if _col in DPO_CATEGORY_COLUMNS:
+            _dtype_map[_col] = "category"
+        elif _col in DPO_FLOAT_COLUMNS:
+            _dtype_map[_col] = "float32"
+        elif _col in DPO_TEXT_COLUMNS:
+            _dtype_map[_col] = str
+
+    dpo_df = pd.read_csv(DPO_PATH, dtype=_dtype_map)
+    dpo_df.columns = dpo_df.columns.str.strip()
+
+    for col in dpo_df.columns:
+        if col == "stable":
+            dpo_df[col] = (
+                dpo_df[col].fillna(0).astype(str).str.strip().isin(["1", "1.0", "True", "true"])
+            )
+        elif col in DPO_TEXT_COLUMNS:
+            dpo_df[col] = dpo_df[col].fillna("").astype(str).str.strip()
+
+elements_df = pd.read_csv(ELEMENTS_PATH, dtype=str, keep_default_na=False)
 elements_df.columns = elements_df.columns.str.strip()
 
-for col in dpo_df.columns:
-    dpo_df[col] = dpo_df[col].str.strip()
-
 for col in elements_df.columns:
-    elements_df[col] = elements_df[col].str.strip()
-
-# Columns with a small number of repeated values compress dramatically with
-# category dtype (pandas stores each unique string once + an integer code
-# per row, instead of a full string per row).
-for col in ("DPO_Type", "A_site_key", "B_site_key", "Material_Status", "stable"):
-    if col in dpo_df.columns:
-        dpo_df[col] = dpo_df[col].astype("category")
+    elements_df[col] = elements_df[col].astype(str).str.strip()
 
 print(f"[AtomAI] {len(dpo_df):,} DPO rows, {len(elements_df):,} element rows loaded.")
+
+try:
+    import resource
+
+    _peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    print(f"[AtomAI] Peak memory after data load: {_peak_mb:.1f} MB")
+except ImportError:
+    pass  # resource module isn't available on Windows; harmless to skip
 
 # ----------------------------------------------------------------------
 # Build fast lookup indexes (runs once at startup)
@@ -99,42 +139,22 @@ def site_key_tuple(raw: str) -> tuple:
 
 print("[AtomAI] Building search index...")
 
-# dpo_index maps (a_key, b_key) -> list of integer row positions in dpo_df.
-# No row data is copied here — just cheap ints — so this index stays a
-# small fraction of the DataFrame's own size no matter how many rows there are.
 dpo_index = defaultdict(list)
-a_site_col = dpo_df.columns.get_loc("A_site_key")
-b_site_col = dpo_df.columns.get_loc("B_site_key")
-for pos, (a_raw, b_raw) in enumerate(
-    zip(dpo_df.iloc[:, a_site_col], dpo_df.iloc[:, b_site_col])
-):
-    a_key = site_key_tuple(a_raw)
-    b_key = site_key_tuple(b_raw)
-    dpo_index[(a_key, b_key)].append(pos)
+for i, row in enumerate(dpo_df.itertuples(index=False)):
+    a_key = site_key_tuple(row.A_site_key)
+    b_key = site_key_tuple(row.B_site_key)
+    dpo_index[(a_key, b_key)].append(i)
+
+# A_site_key / B_site_key are only needed to build the index above — drop
+# them now to free that memory since nothing after this point uses them.
+dpo_df.drop(columns=["A_site_key", "B_site_key"], inplace=True)
 
 elements_index = elements_df.set_index("Atom_Key").to_dict(orient="index")
 
 # Sorted list of unique element symbols for the search dropdowns
 element_symbols = sorted(elements_df["Element"].dropna().unique())
 
-# Counts for the homepage stat cards
-known_count = int((dpo_df["Material_Status"] == "Known").sum())
-predicted_count = int((dpo_df["Material_Status"] == "Predicted").sum())
-
-# Pre-parsed numeric Band_Gap column (float32, not float64 — halves the
-# memory of this column with no meaningful precision loss for a band gap).
-dpo_df["_band_gap_num"] = pd.to_numeric(dpo_df["Band_Gap"], errors="coerce").astype("float32")
-
 print(f"[AtomAI] Index built: {len(dpo_index):,} unique site-key combinations.")
-
-try:
-    import resource
-
-    peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # KB -> MB on Linux
-    print(f"[AtomAI] Peak memory after startup: {peak_mb:,.0f} MB")
-except ImportError:
-    pass  # resource is Unix-only; harmless to skip on other platforms
-
 print("[AtomAI] Ready.")
 
 
@@ -164,92 +184,10 @@ def lookup_atoms(formula_with_os: str) -> list:
 
 def to_number(value, default=None):
     try:
-        return float(value)
+        value = float(value)
     except (TypeError, ValueError):
         return default
-
-
-def format_oxidation_state(raw: str) -> str:
-    """'Ba2+, Sr2+, Ni2+, W6+' -> 'Ba<sup>2+</sup> Sr<sup>2+</sup> Ni<sup>2+</sup> W<sup>6+</sup>'."""
-    parts = []
-    for token in (p.strip() for p in (raw or "").split(",")):
-        if not token:
-            continue
-        m = re.match(r"^([A-Za-z]+)(\d+)([+\-])$", token)
-        if m:
-            elem, num, sign = m.groups()
-            parts.append(f"{elem}<sup>{num}{sign}</sup>")
-        else:
-            parts.append(token)
-    return " ".join(parts)
-
-
-def split_dpo_type(raw: str) -> dict:
-    """'Type 1: AA\u2032BB\u2032O6' -> {'label': 'Type 1', 'pattern': 'AA\u2032BB\u2032O6'}."""
-    raw = (raw or "").strip()
-    if ":" in raw:
-        label, pattern = raw.split(":", 1)
-    else:
-        label, pattern = raw, ""
-    label = label.strip()
-    pattern = pattern.strip().replace("'", "\u2032")
-    return {"label": label, "pattern": pattern}
-
-
-def build_material_dict(row: dict) -> dict:
-    """Turn one dpo_database.csv row (dict) into the material dict every
-    template / API response uses. Shared by the site-chemistry search and
-    the band-gap range search so both stay perfectly in sync."""
-    dpo_type = split_dpo_type(row["DPO_Type"])
-    return {
-        "Formula": row["Formula"],
-        "DPO_Type": row["DPO_Type"],
-        "dpo_type_label": dpo_type["label"],
-        "dpo_type_pattern": dpo_type["pattern"],
-        "formula_oxidation": row["Formula_with_Oxidation_State"],
-        "Band_Gap": to_number(row["Band_Gap"], 0.0),
-        "tolerance_factor": to_number(row["tolerance_factor"]),
-        "mu": to_number(row["mu"]),
-        "mu_a": to_number(row["mu_a"]),
-        "mu_b": to_number(row["mu_b"]),
-        "stable": row["stable"] in ("1", "1.0", "True", "true"),
-        "mean_confidence": to_number(row["mean_confidence"]),
-        "Material_Status": row["Material_Status"] or "Unknown",
-        "atoms": lookup_atoms(row["Formula_with_Oxidation_State"]),
-    }
-
-
-app.jinja_env.filters["oxidation"] = format_oxidation_state
-
-
-# ----------------------------------------------------------------------
-# Filtering (modular — add more criteria here as needed, e.g. stability,
-# Material_Status, DPO_Type, tolerance_factor, mu... every filter just
-# narrows dpo_df in memory and reuses build_material_dict for the output).
-# ----------------------------------------------------------------------
-
-MAX_BAND_GAP_RESULTS = 500  # keep the response snappy on a 500k+ row table
-
-
-def filter_by_band_gap(min_v: float, max_v: float, statuses=None) -> tuple:
-    """Return (materials, total_matches) for every row whose Band_Gap falls
-    inside [min_v, max_v]. Rows with missing/invalid Band_Gap are ignored.
-    Runs entirely in memory against the pre-parsed _band_gap_num column.
-
-    statuses: optional list restricting results to those Material_Status
-    values (e.g. ["Known"], ["Predicted"], or ["Known", "Predicted"]).
-    An empty/omitted list means no status filter — every status matches.
-    """
-    mask = dpo_df["_band_gap_num"].notna() & dpo_df["_band_gap_num"].between(min_v, max_v)
-    if statuses:
-        mask &= dpo_df["Material_Status"].str.strip().isin(statuses)
-    matches = dpo_df.loc[mask]
-    total_matches = len(matches)
-    materials = [
-        build_material_dict(row._asdict())
-        for row in matches.head(MAX_BAND_GAP_RESULTS).itertuples(index=False)
-    ]
-    return materials, total_matches
+    return default if value != value else value  # value != value is True only for NaN
 
 
 # ----------------------------------------------------------------------
@@ -275,17 +213,34 @@ def home():
         else:
             a_key = tuple(sorted([A, Ap]))
             b_key = tuple(sorted([B, Bp]))
-            positions = dpo_index.get((a_key, b_key))
+            matches = dpo_index.get((a_key, b_key))
 
-            if not positions:
+            if not matches:
                 message = (
                     "No Double Perovskite Oxide was found for this combination "
                     "in the current AtomAI database. Try another set of elements."
                 )
             else:
-                materials = [
-                    build_material_dict(dpo_df.iloc[pos].to_dict()) for pos in positions
-                ]
+                materials = []
+                for idx in matches:
+                    row = dpo_df.iloc[idx]
+                    atoms_for_row = lookup_atoms(row["Formula_with_Oxidation_State"])
+                    materials.append(
+                        {
+                            "Formula": row["Formula"],
+                            "DPO_Type": row["DPO_Type"],
+                            "Formula_with_Oxidation_State": row["Formula_with_Oxidation_State"],
+                            "Band_Gap": to_number(row["Band_Gap"], 0.0),
+                            "tolerance_factor": to_number(row["tolerance_factor"]),
+                            "mu": to_number(row["mu"]),
+                            "mu_a": to_number(row["mu_a"]),
+                            "mu_b": to_number(row["mu_b"]),
+                            "stable": bool(row["stable"]),
+                            "mean_confidence": to_number(row["mean_confidence"]),
+                            "Material_Status": row["Material_Status"] or "Unknown",
+                            "atoms": atoms_for_row,
+                        }
+                    )
     return render_template(
         "index.html",
         elements=element_symbols,
@@ -294,48 +249,8 @@ def home():
         submitted=submitted,
         total_materials=f"{len(dpo_df):,}",
         total_elements=f"{elements_df['Element'].nunique():,}",
-        total_elements_raw=elements_df["Element"].nunique(),
-        total_known=known_count,
-        total_predicted=predicted_count,
-    )
-
-
-@app.route("/api/band-gap-search", methods=["POST"])
-def band_gap_search():
-    data = request.get_json(silent=True) or request.form
-    min_v = to_number(data.get("min"))
-    max_v = to_number(data.get("max"))
-    statuses = data.get("statuses") or []
-    if isinstance(statuses, str):  # form-encoded fallback: "Known,Predicted"
-        statuses = [s.strip() for s in statuses.split(",") if s.strip()]
-    valid_statuses = {"Known", "Predicted"}
-    statuses = [s for s in statuses if s in valid_statuses]
-
-    if min_v is None or max_v is None:
-        return jsonify({"error": "Please provide a valid minimum and maximum band gap."}), 400
-    if min_v > max_v:
-        min_v, max_v = max_v, min_v
-
-    materials, total_matches = filter_by_band_gap(min_v, max_v, statuses)
-    return jsonify(
-        {
-            "materials": materials,
-            "total_matches": total_matches,
-            "truncated": total_matches > MAX_BAND_GAP_RESULTS,
-            "shown": len(materials),
-            "min": min_v,
-            "max": max_v,
-            "statuses": statuses,
-        }
     )
 
 
 if __name__ == "__main__":
-    # Local dev: `python app.py` still works exactly as before (debug on,
-    # localhost only). In production a WSGI server (gunicorn, see the
-    # Procfile) imports `app` directly and this block never runs — but we
-    # still read PORT/DEBUG from the environment so a host's "run command"
-    # override or a quick `python app.py` on a server behaves safely.
-    port = int(os.environ.get("PORT", 5000))
-    debug_mode = os.environ.get("FLASK_DEBUG", "1") == "1"
-    app.run(host="0.0.0.0", port=port, debug=debug_mode)
+    app.run(debug=True)
