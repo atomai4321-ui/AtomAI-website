@@ -65,7 +65,10 @@ DPO_TEXT_COLUMNS = {
     "Material_Status",
 }
 
-dpo_df = pd.read_csv(DPO_PATH, keep_default_na=False)
+dpo_df = pd.read_csv(DPO_PATH)  # default NA handling lets numeric columns
+# with blank cells (e.g. mean_confidence) parse cleanly and efficiently in
+# one pass, instead of falling back to a slow, memory-heavy mixed-type
+# column when blanks are treated as literal empty strings.
 elements_df = pd.read_csv(ELEMENTS_PATH, dtype=str, keep_default_na=False)
 
 dpo_df.columns = dpo_df.columns.str.strip()
@@ -74,10 +77,12 @@ elements_df.columns = elements_df.columns.str.strip()
 for col in dpo_df.columns:
     if col == "stable":
         dpo_df[col] = (
-            dpo_df[col].astype(str).str.strip().isin(["1", "1.0", "True", "true"])
+            dpo_df[col].fillna(0).astype(str).str.strip().isin(["1", "1.0", "True", "true"])
         )
     elif col in DPO_TEXT_COLUMNS:
-        dpo_df[col] = dpo_df[col].astype(str).str.strip()
+        # fillna("") first so a genuinely blank cell becomes "" rather than
+        # the literal string "nan".
+        dpo_df[col] = dpo_df[col].fillna("").astype(str).str.strip()
     else:
         # Numeric columns (Band_Gap, tolerance_factor, mu, mu_a, mu_b,
         # mean_confidence, ...): float32 has more than enough precision
