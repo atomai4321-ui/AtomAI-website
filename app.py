@@ -51,14 +51,44 @@ ELEMENTS_PATH = DATA_DIR / "elements.csv"
 
 print("[AtomAI] Loading databases...")
 
-dpo_df = pd.read_csv(DPO_PATH, dtype=str, keep_default_na=False)
+# Only these columns hold genuine text. Everything else in dpo_database.csv
+# is numeric — forcing numeric columns into Python string objects (as the
+# original dtype=str load did) uses several times more memory than native
+# float32 arrays, which is what pushed this app over Render's free 512MB
+# limit. This load keeps numbers as numbers.
+DPO_TEXT_COLUMNS = {
+    "Formula",
+    "DPO_Type",
+    "A_site_key",
+    "B_site_key",
+    "Formula_with_Oxidation_State",
+    "Material_Status",
+}
+
+dpo_df = pd.read_csv(DPO_PATH, keep_default_na=False)
 elements_df = pd.read_csv(ELEMENTS_PATH, dtype=str, keep_default_na=False)
 
 dpo_df.columns = dpo_df.columns.str.strip()
 elements_df.columns = elements_df.columns.str.strip()
 
 for col in dpo_df.columns:
-    dpo_df[col] = dpo_df[col].astype(str).str.strip()
+    if col == "stable":
+        dpo_df[col] = (
+            dpo_df[col].astype(str).str.strip().isin(["1", "1.0", "True", "true"])
+        )
+    elif col in DPO_TEXT_COLUMNS:
+        dpo_df[col] = dpo_df[col].astype(str).str.strip()
+    else:
+        # Numeric columns (Band_Gap, tolerance_factor, mu, mu_a, mu_b,
+        # mean_confidence, ...): float32 has more than enough precision
+        # here and uses half the memory of the pandas default float64.
+        dpo_df[col] = pd.to_numeric(dpo_df[col], errors="coerce").astype("float32")
+
+# DPO_Type and Material_Status repeat the same handful of values across
+# 500k+ rows — storing them as categories instead of full strings saves a
+# large amount of memory for very little cost.
+dpo_df["DPO_Type"] = dpo_df["DPO_Type"].astype("category")
+dpo_df["Material_Status"] = dpo_df["Material_Status"].astype("category")
 
 for col in elements_df.columns:
     elements_df[col] = elements_df[col].astype(str).str.strip()
@@ -78,11 +108,14 @@ def site_key_tuple(raw: str) -> tuple:
 print("[AtomAI] Building search index...")
 
 dpo_index = defaultdict(list)
-for row in dpo_df.itertuples(index=False):
-    row_dict = row._asdict()
-    a_key = site_key_tuple(row_dict["A_site_key"])
-    b_key = site_key_tuple(row_dict["B_site_key"])
-    dpo_index[(a_key, b_key)].append(row_dict)
+for i, row in enumerate(dpo_df.itertuples(index=False)):
+    a_key = site_key_tuple(row.A_site_key)
+    b_key = site_key_tuple(row.B_site_key)
+    dpo_index[(a_key, b_key)].append(i)
+
+# A_site_key / B_site_key are only needed to build the index above — drop
+# them now to free that memory since nothing after this point uses them.
+dpo_df.drop(columns=["A_site_key", "B_site_key"], inplace=True)
 
 elements_index = elements_df.set_index("Atom_Key").to_dict(orient="index")
 
@@ -119,9 +152,10 @@ def lookup_atoms(formula_with_os: str) -> list:
 
 def to_number(value, default=None):
     try:
-        return float(value)
+        value = float(value)
     except (TypeError, ValueError):
         return default
+    return default if value != value else value  # value != value is True only for NaN
 
 
 # ----------------------------------------------------------------------
@@ -156,7 +190,8 @@ def home():
                 )
             else:
                 materials = []
-                for row in matches:
+                for idx in matches:
+                    row = dpo_df.iloc[idx]
                     atoms_for_row = lookup_atoms(row["Formula_with_Oxidation_State"])
                     materials.append(
                         {
@@ -168,7 +203,7 @@ def home():
                             "mu": to_number(row["mu"]),
                             "mu_a": to_number(row["mu_a"]),
                             "mu_b": to_number(row["mu_b"]),
-                            "stable": row["stable"] in ("1", "1.0", "True", "true"),
+                            "stable": bool(row["stable"]),
                             "mean_confidence": to_number(row["mean_confidence"]),
                             "Material_Status": row["Material_Status"] or "Unknown",
                             "atoms": atoms_for_row,
