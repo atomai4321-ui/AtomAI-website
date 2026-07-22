@@ -325,6 +325,47 @@
   </section>
 
   <!-- ============ ABOUT ============ -->
+  <section id="band-gap-search" class="explorer">
+    <div class="section-head reveal">
+      <p class="eyebrow">Advanced Search</p>
+      <h2>Search Materials by Band Gap</h2>
+      <p class="section-lede">Find every Double Perovskite Oxide whose band gap falls inside a chosen range.</p>
+    </div>
+
+    <div class="search-card reveal" id="bandGapCard">
+      <div class="search-grid search-grid--bandgap">
+        <div class="field">
+          <label for="bgMin">Min band gap (eV)</label>
+          <input type="number" step="0.0001" id="bgMin" placeholder="e.g. 0.5">
+        </div>
+        <div class="field">
+          <label for="bgMax">Max band gap (eV)</label>
+          <input type="number" step="0.0001" id="bgMax" placeholder="e.g. 2.5">
+        </div>
+      </div>
+
+      <div class="toggle-row">
+        <span class="toggle-row__label">Material status</span>
+        <div class="toggle-group" id="bgStatusToggle">
+          <button type="button" class="toggle-btn is-active" data-status="Known">Known</button>
+          <button type="button" class="toggle-btn is-active" data-status="Predicted">Predicted</button>
+        </div>
+      </div>
+
+      <button type="button" class="btn btn--search" id="bgSearchBtn">
+        <svg viewBox="0 0 20 20" fill="none"><circle cx="9" cy="9" r="6" stroke="currentColor" stroke-width="2"/><path d="M14 14L18 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        <span>Search Materials</span>
+      </button>
+    </div>
+
+    <div class="table-wrapper reveal" id="bgResultsWrapper">
+      <div class="notice notice--empty">
+        <strong>No results yet.</strong>
+        <p>Enter a band gap range above and click Search Materials.</p>
+      </div>
+    </div>
+  </section>
+
   <section id="about" class="split">
     <div class="split__text reveal">
       <p class="eyebrow eyebrow--icon">
@@ -455,6 +496,15 @@
   </section>
 
 </main>
+
+<div class="modal-overlay" id="materialModalOverlay">
+  <div class="modal" id="materialModal" role="dialog" aria-modal="true" aria-label="Material details">
+    <button type="button" class="modal__close" id="materialModalClose" aria-label="Close">
+      <svg viewBox="0 0 20 20" fill="none"><path d="M5 5L15 15M15 5L5 15" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+    </button>
+    <div class="modal__body" id="materialModalBody"></div>
+  </div>
+</div>
 
 <footer class="footer">
   <div class="footer__inner">
