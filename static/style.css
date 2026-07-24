@@ -1047,12 +1047,9 @@ section { padding: 68px 32px; }
   background: var(--surface-alt);
   padding: 5px 12px;
   border-radius: 999px;
-  text-decoration: none;
   word-break: break-all;
-  transition: color 0.15s ease, border-color 0.15s ease;
   border: 1px solid transparent;
 }
-.team-card__lab:hover { color: var(--accent-ink); border-color: var(--accent); }
 
 .lab-collab {
   max-width: 560px;
