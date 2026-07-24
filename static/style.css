@@ -254,9 +254,7 @@ small { font-weight: 400; }
   right: 0;
   top: calc(100% + 10px);
   width: 268px;
-  background: var(--surface);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
+  background: var(--surface-solid);
   border: 1px solid var(--line-strong);
   border-radius: var(--radius-sm);
   box-shadow: var(--shadow-lg);
@@ -1041,14 +1039,20 @@ section { padding: 68px 32px; }
 .team-card__dept { font-size: 13px; margin-bottom: 12px; }
 .team-card__lab {
   display: inline-block;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
+  max-width: 100%;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
   color: var(--ink-soft);
   background: var(--surface-alt);
-  padding: 4px 10px;
+  padding: 5px 12px;
   border-radius: 999px;
+  text-decoration: none;
+  word-break: break-all;
+  transition: color 0.15s ease, border-color 0.15s ease;
+  border: 1px solid transparent;
 }
+.team-card__lab:hover { color: var(--accent-ink); border-color: var(--accent); }
 
 .lab-collab {
   max-width: 560px;
@@ -1066,11 +1070,11 @@ section { padding: 68px 32px; }
 .lab-collab__logo {
   display: block;
   margin: 4px auto 20px;
-  max-width: 220px;
+  max-width: 140px;
   height: auto;
   background: #F4F6FA;
   border-radius: 12px;
-  padding: 14px 18px;
+  padding: 10px 14px;
 }
 .lab-collab p { font-size: 14.5px; margin-bottom: 18px; }
 
